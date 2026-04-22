@@ -10,22 +10,119 @@ import subprocess
 
 from typing import Annotated, Dict
 
+import psutil
 from fastmcp import FastMCP
 from pydantic import Field
 
 # Version identifier for debugging
-SERVER_VERSION = "v0.1.2-cancel-fix"
+SERVER_VERSION = "v0.1.3-caller-detect"
 
 # The log_level is necessary for Cline to work: https://github.com/jlowin/fastmcp/issues/81
 mcp = FastMCP("Interactive Feedback MCP")
 
-# Configuration
-AUTO_FEEDBACK_TIMEOUT_SECONDS = int(
-    os.getenv("INTERACTIVE_FEEDBACK_TIMEOUT_SECONDS", "290")
-)
+# Timeout configuration
+CLI_AGENT_TIMEOUT_SECONDS = int(os.getenv("INTERACTIVE_FEEDBACK_CLI_TIMEOUT_SECONDS", "60"))
+CHAT_TIMEOUT_SECONDS = int(os.getenv("INTERACTIVE_FEEDBACK_TIMEOUT_SECONDS", "290"))
+
+
+def detect_caller_mode() -> str:
+    """检测 MCP 调用来源：cursor_chat 或 cursor_cli
+
+    通过遍历父进程链来判断：
+    - Cursor Chat (GUI): 父进程链中包含 Cursor Electron 主进程 (Cursor Helper, Electron 等)
+    - Cursor CLI Agent: 父进程链中包含 cursor CLI 命令 (通常带 agent 子命令)
+
+    Returns:
+        "cursor_chat" | "cursor_cli" | "unknown"
+    """
+    try:
+        p = psutil.Process(os.getpid())
+        parent = p.parent()
+        process_chain = []
+
+        while parent:
+            try:
+                name = parent.name().lower()
+                cmdline_parts = parent.cmdline()
+                cmdline = " ".join(cmdline_parts[:5]).lower()
+                process_chain.append((name, cmdline))
+                parent = parent.parent()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                break
+
+        # 输出进程链日志用于调试
+        print("[INFO] Process chain for caller detection:", file=sys.stderr)
+        for name, cmdline in process_chain:
+            print(f"  [{name}] {cmdline}", file=sys.stderr)
+
+        # 检测逻辑
+        for name, cmdline in process_chain:
+            # CLI Agent 特征：cursor CLI 进程，通常命令行中包含 agent 相关参数
+            # macOS: /usr/local/bin/cursor 或类似路径
+            # 关键区分：CLI 是独立的命令行进程，不是 Electron renderer
+            if name == "cursor" and ("agent" in cmdline or "--stdio" not in cmdline):
+                # 进一步确认：CLI 的上层应该是 shell（bash/zsh/fish 等），而不是 Electron
+                continue  # 先收集完整链再判断
+
+            # Cursor GUI (Electron) 特征
+            if "cursor helper" in name or "cursor helper" in cmdline:
+                return "cursor_chat"
+            if name == "electron" or "electron" in cmdline:
+                return "cursor_chat"
+            # macOS 上 Cursor.app 的主进程
+            if "cursor.app" in cmdline:
+                return "cursor_chat"
+            # Cursor 主进程（非 CLI）
+            if name == "cursor" and (".app" in cmdline or "electron" in cmdline):
+                return "cursor_chat"
+
+        # 第二轮：检测 CLI Agent
+        for name, cmdline in process_chain:
+            # cursor CLI 通常是一个独立二进制，父进程是 shell
+            if name == "cursor" and "agent" in cmdline:
+                return "cursor_cli"
+            # 有些情况下 CLI 进程名可能是 cursor-cli 或包含 cli 关键字
+            if "cursor" in name and "cli" in name:
+                return "cursor_cli"
+            if "cursor" in name and "cli" in cmdline:
+                return "cursor_cli"
+
+        # 第三轮：通过 shell 父进程间接判断
+        # 如果进程链中有 cursor 进程，且其父进程是 shell（bash/zsh/fish），大概率是 CLI
+        for i, (name, cmdline) in enumerate(process_chain):
+            if "cursor" in name:
+                # 检查它的父进程（链中下一个）是否是 shell
+                if i + 1 < len(process_chain):
+                    parent_name = process_chain[i + 1][0]
+                    if parent_name in ("bash", "zsh", "fish", "sh", "dash", "tcsh"):
+                        return "cursor_cli"
+                # 如果 cursor 是链中最顶层进程，也可能是 CLI
+                return "cursor_cli"
+
+        return "unknown"
+
+    except Exception as e:
+        print(f"[WARN] Failed to detect caller mode: {e}", file=sys.stderr)
+        return "unknown"
+
+
+def get_timeout_for_caller() -> int:
+    """根据调用来源返回合适的超时时间"""
+    mode = detect_caller_mode()
+    if mode == "cursor_cli":
+        timeout = CLI_AGENT_TIMEOUT_SECONDS
+    elif mode == "cursor_chat":
+        timeout = CHAT_TIMEOUT_SECONDS
+    else:
+        # 未知来源，使用 Chat 的默认值（更保守）
+        timeout = CHAT_TIMEOUT_SECONDS
+    print(f"[INFO] Caller mode: {mode}, timeout: {timeout}s", file=sys.stderr)
+    return timeout
+
 
 # Log version on startup
 print(f"[INFO] Interactive Feedback MCP {SERVER_VERSION} starting...", file=sys.stderr)
+print(f"[INFO] CLI timeout: {CLI_AGENT_TIMEOUT_SECONDS}s, Chat timeout: {CHAT_TIMEOUT_SECONDS}s", file=sys.stderr)
 
 
 def _cleanup_process(proc: subprocess.Popen | None) -> None:
@@ -198,11 +295,12 @@ async def interactive_feedback(
     - Maintain continuous dialogue by repeatedly calling this tool
 
     """
+    timeout = get_timeout_for_caller()
     return await launch_feedback_ui_async(
         first_line(project_directory),
-        first_line(summary),
+        summary,
         first_line(task_id),
-        AUTO_FEEDBACK_TIMEOUT_SECONDS,
+        timeout,
     )
 
 
