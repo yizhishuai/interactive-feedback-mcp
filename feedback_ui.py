@@ -48,6 +48,9 @@ CONFIRMATION_INSTRUCTIONS = """
 
 请先输出你经过架构师的角度思考后的执行计划和方案，然后调用interactive_feedback工具拉起反馈窗口来询问用户对该方案是否满意，等待用户在反馈窗口输入肯定的指令后再执行该方案，如果用户不同意该方案请思考其他方案后再次请求用户确认。"""
 
+# Instructions returned when the user clicks the "暂停" button
+PAUSE_INSTRUCTIONS = """请先调用一次 ask_question（AskUserQuestion）工具，向用户确认具体的需求细节，得到用户明确确认后再继续执行，不得直接开始执行。"""
+
 
 class FeedbackResult(TypedDict):
     interactive_feedback: str
@@ -373,6 +376,7 @@ class FeedbackUI(QMainWindow):
         command_section_visible = self.settings.value(
             "commandSectionVisible", False, type=bool
         )
+        loaded_draft_input = self.settings.value("draft_input", "", type=str)
         self.settings.endGroup()
 
         # If no task-specific settings found, try project settings for backward compatibility
@@ -402,6 +406,14 @@ class FeedbackUI(QMainWindow):
         }
 
         self._create_ui()  # self.config is used here to set initial values
+
+        # 恢复上次超时未提交的草稿
+        if loaded_draft_input:
+            self.feedback_text.setPlainText(loaded_draft_input)
+            # 将光标移到末尾，方便继续输入
+            cursor = self.feedback_text.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.feedback_text.setTextCursor(cursor)
 
         # Command section is permanently hidden
         self.command_group.setVisible(False)
@@ -463,6 +475,22 @@ class FeedbackUI(QMainWindow):
 
         self.description_label.setFixedHeight(target_height)
 
+    def _save_draft(self):
+        """保存用户输入的草稿到 QSettings，以便下次窗口恢复"""
+        user_input = self.feedback_text.toPlainText().strip()
+        self.settings.beginGroup(self.task_group_name)
+        if user_input:
+            self.settings.setValue("draft_input", user_input)
+        else:
+            self.settings.remove("draft_input")
+        self.settings.endGroup()
+
+    def _clear_draft(self):
+        """清除已保存的草稿"""
+        self.settings.beginGroup(self.task_group_name)
+        self.settings.remove("draft_input")
+        self.settings.endGroup()
+
     def _auto_submit_feedback(self):
         """Auto submit feedback with default message after timeout"""
         user_input = self.feedback_text.toPlainText().strip()
@@ -473,6 +501,9 @@ class FeedbackUI(QMainWindow):
             clipboard = QApplication.clipboard()
             clipboard.setText(user_input)
             self._append_log("[信息] 用户输入已复制到剪切板\n")
+            # 保存草稿，下次打开窗口时恢复
+            self._save_draft()
+            self._append_log("[信息] 用户输入已保存为草稿，下次打开窗口时将自动恢复\n")
         # Always submit default feedback after timeout
         self.feedback_text.setPlainText(
             "好的，代码先保持现状，然后重新调用 interactive_feedback 工具，调用interactive_feedback后会有一个窗口，我将在窗口中告诉你下一步指令，请先调用interactive_feedback工具"
@@ -910,6 +941,32 @@ class FeedbackUI(QMainWindow):
         self.submit_button.setStyleSheet(self._submit_button_default_style)
         self.submit_button.clicked.connect(self._on_submit_clicked)
 
+        # Pause button - returns control to the LLM asking it to clarify via ask_question
+        self.pause_button = QPushButton("⏸️ 暂停")
+        self.pause_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2a2a2a;
+                color: #e0a030;
+                border: 1px solid #6a5020;
+                border-radius: 8px;
+                padding: 12px 16px;
+                font-size: 14px;
+                font-weight: 600;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #333333;
+                border-color: #e0a030;
+            }
+            QPushButton:pressed {
+                background-color: #1a1a1a;
+            }
+        """)
+        self.pause_button.setToolTip(
+            "忽略输入框内容，直接让大模型调用一次 ask_question 确认需求后再执行"
+        )
+        self.pause_button.clicked.connect(self._pause_and_confirm)
+
         # Confirmation checkbox - Clean dark style
         self.confirm_before_execute_check = QCheckBox("🔍 需要先确认方案后再执行")
         self.confirm_before_execute_check.setStyleSheet("""
@@ -934,9 +991,14 @@ class FeedbackUI(QMainWindow):
             }
         """)
 
+        submit_row_layout = QHBoxLayout()
+        submit_row_layout.setSpacing(8)
+        submit_row_layout.addWidget(self.submit_button, 3)
+        submit_row_layout.addWidget(self.pause_button, 1)
+
         feedback_layout.addWidget(self.feedback_text)
         feedback_layout.addWidget(self.confirm_before_execute_check)
-        feedback_layout.addWidget(self.submit_button)
+        feedback_layout.addLayout(submit_row_layout)
 
         # Set minimum height for feedback_group to accommodate its contents
         # This will be based on the description label and the expanded feedback_text
@@ -1100,6 +1162,9 @@ class FeedbackUI(QMainWindow):
         if self.countdown_timer.isActive():
             self.countdown_timer.stop()
 
+        # 用户正常提交，清除草稿
+        self._clear_draft()
+
         user_input = self.feedback_text.toPlainText().strip()
 
         # Add additional instruction text to user input
@@ -1118,6 +1183,27 @@ class FeedbackUI(QMainWindow):
             self.feedback_result = FeedbackResult(
                 interactive_feedback=user_input_with_suffix
             )
+
+        # Emit signal before closing
+        self.feedback_signals.feedback_ready.emit(self.feedback_result)
+
+        self.close()
+
+    def _pause_and_confirm(self):
+        """Ignore any text in the input box and immediately hand control back to
+        the LLM, instructing it to call ask_question once before proceeding."""
+        # Reset confirmation mode if active
+        if self._pending_confirm:
+            self._reset_confirm_mode()
+
+        # Stop both timers when submitting
+        if self.auto_feedback_timer.isActive():
+            self.auto_feedback_timer.stop()
+        if self.countdown_timer.isActive():
+            self.countdown_timer.stop()
+
+        # 忽略输入框内容，不保存/清除草稿
+        self.feedback_result = FeedbackResult(interactive_feedback=PAUSE_INSTRUCTIONS)
 
         # Emit signal before closing
         self.feedback_signals.feedback_ready.emit(self.feedback_result)

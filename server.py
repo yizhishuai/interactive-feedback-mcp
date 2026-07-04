@@ -264,7 +264,7 @@ async def interactive_feedback(
     summary: Annotated[
         str,
         Field(
-            description="Brief one-line summary of changes or question to ask the user"
+            description="Detailed summary shown to the user in the feedback window. Include ALL relevant information: what was done, why, key decisions, file changes, and next steps. Do NOT leave important content only in the chat panel — this field is the primary way the user reads your work."
         ),
     ],
     task_id: Annotated[
@@ -279,7 +279,7 @@ async def interactive_feedback(
 
     Parameters:
     - project_directory: Full path to the project directory being worked on
-    - summary: Brief one-line summary of changes made, or a specific question to ask the user
+    - summary: Detailed explanation shown in the feedback window — this is the ONLY place the user reads your output. Write everything here: what you did, which files changed, key decisions, trade-offs, and what you need from the user next. Never write a vague one-liner like "done, what's next?" — give the user enough context to make a decision.
     - task_id: Task identifier to distinguish different tasks (required)
 
     Usage:
@@ -290,7 +290,7 @@ async def interactive_feedback(
     Important Rules:
     - Always call this tool after completing any work or response
     - Never end conversation unless user explicitly says "end conversation"
-    - Use summary parameter for brief updates or specific questions to the user
+    - The summary field is the user's primary reading surface — put ALL meaningful content there, not in the chat panel
     - Use task_id parameter to help users distinguish between different tasks
     - Maintain continuous dialogue by repeatedly calling this tool
 
