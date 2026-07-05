@@ -51,6 +51,12 @@ CONFIRMATION_INSTRUCTIONS = """
 # Instructions returned when the user clicks the "暂停" button
 PAUSE_INSTRUCTIONS = """请先调用一次 ask_question（AskUserQuestion）工具，向用户确认具体的需求细节，得到用户明确确认后再继续执行，不得直接开始执行。"""
 
+# Instructions returned when the user clicks the "结束" button
+END_SESSION_INSTRUCTIONS = """请对本次会话进行总结（做了什么、关键决策、遇到的问题、后续注意事项），并在当前项目的 docs/ 目录下按以下结构写入或更新总结文档：
+1. docs/INDEX.md —— 索引文件，每条一行，格式为「日期 - 主题 - 一句话摘要 - 指向具体文件」，方便未来新会话或人工快速定位；
+2. docs/日期-主题.md —— 本次会话的详细总结内容。
+写入完成后本次会话到此结束，不需要再调用 interactive_feedback 工具。"""
+
 
 class FeedbackResult(TypedDict):
     interactive_feedback: str
@@ -967,6 +973,32 @@ class FeedbackUI(QMainWindow):
         )
         self.pause_button.clicked.connect(self._pause_and_confirm)
 
+        # End button - asks the LLM to summarize the session into docs/ and stop
+        self.end_button = QPushButton("🏁 结束")
+        self.end_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2a2a2a;
+                color: #e05050;
+                border: 1px solid #6a2020;
+                border-radius: 8px;
+                padding: 12px 16px;
+                font-size: 14px;
+                font-weight: 600;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #333333;
+                border-color: #e05050;
+            }
+            QPushButton:pressed {
+                background-color: #1a1a1a;
+            }
+        """)
+        self.end_button.setToolTip(
+            "忽略输入框内容，让大模型把本次会话总结写入项目 docs/ 目录后直接结束会话"
+        )
+        self.end_button.clicked.connect(self._end_session)
+
         # Confirmation checkbox - Clean dark style
         self.confirm_before_execute_check = QCheckBox("🔍 需要先确认方案后再执行")
         self.confirm_before_execute_check.setStyleSheet("""
@@ -995,6 +1027,7 @@ class FeedbackUI(QMainWindow):
         submit_row_layout.setSpacing(8)
         submit_row_layout.addWidget(self.submit_button, 3)
         submit_row_layout.addWidget(self.pause_button, 1)
+        submit_row_layout.addWidget(self.end_button, 1)
 
         feedback_layout.addWidget(self.feedback_text)
         feedback_layout.addWidget(self.confirm_before_execute_check)
@@ -1204,6 +1237,32 @@ class FeedbackUI(QMainWindow):
 
         # 忽略输入框内容，不保存/清除草稿
         self.feedback_result = FeedbackResult(interactive_feedback=PAUSE_INSTRUCTIONS)
+
+        # Emit signal before closing
+        self.feedback_signals.feedback_ready.emit(self.feedback_result)
+
+        self.close()
+
+    def _end_session(self):
+        """Ignore any text in the input box and tell the LLM to summarize this
+        session into project docs/ and stop calling interactive_feedback."""
+        # Reset confirmation mode if active
+        if self._pending_confirm:
+            self._reset_confirm_mode()
+
+        # Stop both timers when submitting
+        if self.auto_feedback_timer.isActive():
+            self.auto_feedback_timer.stop()
+        if self.countdown_timer.isActive():
+            self.countdown_timer.stop()
+
+        # 用户主动结束会话，清除草稿
+        self._clear_draft()
+
+        # 忽略输入框内容
+        self.feedback_result = FeedbackResult(
+            interactive_feedback=END_SESSION_INSTRUCTIONS
+        )
 
         # Emit signal before closing
         self.feedback_signals.feedback_ready.emit(self.feedback_result)
