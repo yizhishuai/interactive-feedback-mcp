@@ -24,10 +24,12 @@ from PySide6.QtWidgets import (
     QComboBox,
     QTextEdit,
     QPlainTextEdit,
+    QTextBrowser,
     QGroupBox,
     QSizePolicy,
     QDialog,
     QScrollArea,
+    QSplitter,
 )
 from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSettings
 from PySide6.QtGui import (
@@ -544,47 +546,13 @@ class FeedbackUI(QMainWindow):
             self.countdown_timer.stop()
 
     def _adjust_description_height(self):
-        """Adjust description label height based on content length"""
+        """Set a sensible initial height without preventing user resizing."""
         if not hasattr(self, "description_label") or not self.description_label:
             return
 
-        # Get text content
-        text = self.description_label.toPlainText()
-        if not text.strip():
-            self.description_label.setFixedHeight(80)
-            return
-
-        # Calculate lines (rough estimation)
-        font_metrics = self.description_label.fontMetrics()
-        line_height = font_metrics.lineSpacing()
-
-        # Use estimated width since actual width may not be available during initialization
-        # Assume typical width for the widget area (accounting for margins and other UI elements)
-        estimated_width = 700  # Rough estimate based on window width minus margins
-        text_width = estimated_width - 40  # Account for padding and margins
-
-        # Count actual lines by splitting and measuring
-        lines = text.split("\n")
-        total_lines = 0
-        for line in lines:
-            if not line.strip():
-                total_lines += 1
-            else:
-                # Estimate wrapped lines
-                line_width = font_metrics.horizontalAdvance(line)
-                if line_width <= text_width:
-                    total_lines += 1
-                else:
-                    wrapped_lines = (line_width // text_width) + 1
-                    total_lines += wrapped_lines
-
-        # Calculate target height with padding
-        content_height = (
-            total_lines * line_height + 24
-        )  # Add padding for top/bottom margins
-        target_height = min(200, max(80, content_height))
-
-        self.description_label.setFixedHeight(target_height)
+        # This widget lives in a QSplitter.  Do not use setFixedHeight here: it
+        # would make the prompt panel impossible to enlarge with the splitter.
+        self.description_label.setMinimumHeight(120)
 
     def _get_selected_workflow_key(self) -> str:
         if not hasattr(self, "workflow_combo"):
@@ -1157,13 +1125,16 @@ class FeedbackUI(QMainWindow):
 
         feedback_layout.addLayout(header_layout)
 
-        # Short description text edit - Simple styling
-        self.description_label = QPlainTextEdit(self.prompt)
+        # Prompt panel: QTextBrowser renders the Markdown supplied by the caller.
+        # The vertical splitter below lets users allocate more space to this panel
+        # instead of only scrolling through a fixed-height plain-text view.
+        self.description_label = QTextBrowser()
         self.description_label.setReadOnly(True)
-        # Set fixed height for short content, expandable for longer content
+        self.description_label.setOpenExternalLinks(True)
+        self.description_label.setMarkdown(self.prompt)
         self._adjust_description_height()
         self.description_label.setStyleSheet("""
-            QPlainTextEdit {
+            QTextBrowser {
                 color: #c0c0c0;
                 font-size: 13px;
                 line-height: 1.4;
@@ -1173,11 +1144,22 @@ class FeedbackUI(QMainWindow):
                 border: none;
                 selection-background-color: #606060;
             }
-            QPlainTextEdit:focus {
+            QTextBrowser:focus {
                 border: 1px solid #606060;
             }
+            QTextBrowser a {
+                color: #79b8ff;
+            }
+            QTextBrowser code {
+                background-color: #303030;
+                color: #f0d890;
+            }
+            QTextBrowser pre {
+                background-color: #202020;
+                border: 1px solid #505050;
+                padding: 8px;
+            }
         """)
-        feedback_layout.addWidget(self.description_label)
 
         # Feedback text input - Clean dark design with more space
         self.feedback_text = FeedbackTextEdit()
@@ -1505,15 +1487,39 @@ class FeedbackUI(QMainWindow):
         submit_row_layout.addWidget(self.pause_button, 1)
         submit_row_layout.addWidget(self.end_button, 1)
 
-        feedback_layout.addWidget(self.feedback_text)
+        self.content_splitter = QSplitter(Qt.Vertical)
+        self.content_splitter.setChildrenCollapsible(False)
+        self.content_splitter.setHandleWidth(8)
+        self.content_splitter.setStyleSheet("""
+            QSplitter::handle:vertical {
+                background-color: #404040;
+                border-radius: 3px;
+                margin: 3px 0;
+            }
+            QSplitter::handle:vertical:hover {
+                background-color: #606060;
+            }
+        """)
+        self.description_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.feedback_text.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.content_splitter.addWidget(self.description_label)
+        self.content_splitter.addWidget(self.feedback_text)
+        self.content_splitter.setStretchFactor(0, 3)
+        self.content_splitter.setStretchFactor(1, 2)
+        self.content_splitter.setSizes([260, 160])
+        self.content_splitter.setMinimumHeight(300)
+        feedback_layout.addWidget(self.content_splitter, 1)
         feedback_layout.addWidget(self.confirm_before_execute_check)
         feedback_layout.addLayout(submit_row_layout)
 
         # Set minimum height for feedback_group to accommodate its contents
         # This will be based on the description label and the expanded feedback_text
         self.feedback_group.setMinimumHeight(
-            self.description_label.sizeHint().height()
-            + self.feedback_text.minimumHeight()
+            self.content_splitter.minimumHeight()
             + self.submit_button.sizeHint().height()
             + feedback_layout.spacing() * 3  # More spacing for header layout
             + feedback_layout.contentsMargins().top()
